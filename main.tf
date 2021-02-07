@@ -21,6 +21,21 @@ resource "azurerm_resource_group" "rg" {
   }
 }
 
+resource "random_string" "rs" {
+  length  = 6
+  special = false
+  upper   = false
+  number  = false
+}
+
+resource "azurerm_public_ip" "pip" {
+  name                = "pip-iac1"
+  allocation_method   = "Static"
+  domain_name_label   = random_string.rs.result
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+}
+
 resource "azurerm_virtual_network" "vnet" {
   name                = "vnet-iac1"
   address_space       = ["10.0.0.0/16"]
@@ -30,17 +45,42 @@ resource "azurerm_virtual_network" "vnet" {
 
 resource "azurerm_subnet" "snet" {
   name                 = "snet-iac1"
-  address_prefixes     = ["10.0.2.0/24"]
+  address_prefixes     = ["10.0.1.0/24"]
   virtual_network_name = azurerm_virtual_network.vnet.name
   resource_group_name  = azurerm_resource_group.rg.name
 }
 
-resource "azurerm_public_ip" "pip" {
-  name                    = "pip-iac1"
-  allocation_method       = "Dynamic"
-  idle_timeout_in_minutes = 30
-  resource_group_name     = azurerm_resource_group.rg.name
-  location                = azurerm_resource_group.rg.location
+resource "azurerm_mysql_server" "mysql" {
+  name                              = "mysql-iac1"
+  version                           = "5.7"
+  administrator_login               = "root"
+  administrator_login_password      = "admin1234"
+  create_mode                       = "Default"
+  sku_name                          = "B_Gen5_2"
+  storage_mb                        = 5120
+  backup_retention_days             = 7
+  geo_redundant_backup_enabled      = false
+  infrastructure_encryption_enabled = false
+  public_network_access_enabled     = true
+  ssl_enforcement_enabled           = false
+  resource_group_name               = azurerm_resource_group.rg.name
+  location                          = azurerm_resource_group.rg.location
+}
+
+resource "azurerm_mysql_firewall_rule" "mysql_rule" {
+  name                = "mysql-iac1-rule"
+  start_ip_address    = azurerm_public_ip.pip.ip_address
+  end_ip_address      = azurerm_public_ip.pip.ip_address
+  server_name         = azurerm_mysql_server.mysql.name
+  resource_group_name = azurerm_resource_group.rg.name
+}
+
+resource "azurerm_mysql_database" "mysql_db" {
+  name                = "mysql-iac1-db"
+  charset             = "utf8"
+  collation           = "utf8_unicode_ci"
+  server_name         = azurerm_mysql_server.mysql.name
+  resource_group_name = azurerm_resource_group.rg.name
 }
 
 resource "azurerm_lb" "lb" {
@@ -55,16 +95,13 @@ resource "azurerm_lb" "lb" {
 }
 
 resource "azurerm_lb_backend_address_pool" "lbap" {
-  name                = "lbap-iac1"
-  loadbalancer_id     = azurerm_lb.lb.id
-  resource_group_name = azurerm_resource_group.rg.name
+  name            = "lbap-iac1"
+  loadbalancer_id = azurerm_lb.lb.id
 }
 
 resource "azurerm_lb_probe" "lbp" {
   name                = "lbp-iac1"
   port                = 80
-  protocol            = "Http"
-  request_path        = "/wpadmin/images/wordpress-logo.svg"
   loadbalancer_id     = azurerm_lb.lb.id
   resource_group_name = azurerm_resource_group.rg.name
 }
@@ -81,12 +118,27 @@ resource "azurerm_lb_rule" "lbr" {
   resource_group_name            = azurerm_resource_group.rg.name
 }
 
+data "template_file" "tpl" {
+  template = file("docker-wordpress-install.conf")
+}
+
+data "template_cloudinit_config" "config" {
+  gzip          = true
+  base64_encode = true
+  depends_on    = [azurerm_mysql_server.mysql]
+
+  part {
+    filename     = "docker-wordpress-install.conf"
+    content_type = "text/cloud-config"
+    content      = data.template_file.tpl.rendered
+  }
+}
+
 resource "azurerm_virtual_machine_scale_set" "vmss" {
   name                = "vmss-iac1"
+  upgrade_policy_mode = "Manual"
   resource_group_name = azurerm_resource_group.rg.name
   location            = azurerm_resource_group.rg.location
-
-  upgrade_policy_mode = "Manual"
 
   sku {
     name     = "Standard_F2"
@@ -117,17 +169,13 @@ resource "azurerm_virtual_machine_scale_set" "vmss" {
 
   os_profile {
     computer_name_prefix = "wpvm"
-    admin_username       = "wpadmin"
-    custom_data          = file("web.conf")
+    admin_username       = "root"
+    admin_password       = "admin1234"
+    custom_data          = data.template_cloudinit_config.config.rendered
   }
 
   os_profile_linux_config {
     disable_password_authentication = true
-
-    ssh_keys {
-      path     = "/home/wpadmin/.ssh/authorizad_keys"
-      key_data = file("~/.ssh/id_rsa.pub")
-    }
   }
 
   network_profile {
@@ -139,193 +187,6 @@ resource "azurerm_virtual_machine_scale_set" "vmss" {
       primary                             = true
       subnet_id                           = azurerm_subnet.snet.id
       load_balancer_inbound_nat_rules_ids = [azurerm_lb_backend_address_pool.lbap.id]
-    }
-  }
-
-  tags = {
-    "environment" = "DEV"
-  }
-}
-
-resource "azurerm_monitor_autoscale_setting" "mas" {
-  name                = "mas-iac1"
-  target_resource_id  = azurerm_virtual_machine_scale_set.vmss.id
-  resource_group_name = azurerm_resource_group.rg.name
-  location            = azurerm_resource_group.rg.location
-
-  profile {
-    name = "profile1"
-
-    capacity {
-      default = 2
-      minimum = 2
-      maximum = 3
-    }
-
-    rule {
-      metric_trigger {
-        metric_name        = "Percentage CPU"
-        metric_resource_id = azurerm_virtual_machine_scale_set.vmss.id
-        time_grain         = "PT1M"
-        statistic          = "Average"
-        time_window        = "PT5M"
-        time_aggregation   = "Average"
-        operator           = "GreaterThen"
-        threshold          = 50
-      }
-
-      scale_action {
-        direction = "Increase"
-        type      = "ChangeCount"
-        value     = 1
-        cooldown  = "PT1M"
-      }
-    }
-
-    rule {
-      metric_trigger {
-        metric_name        = "Percentage CPU"
-        metric_resource_id = azurerm_virtual_machine_scale_set.vmss.id
-        time_grain         = "PT1M"
-        statistic          = "Average"
-        time_window        = "PT5M"
-        time_aggregation   = "Average"
-        operator           = "LessThen"
-        threshold          = 25
-      }
-
-      scale_action {
-        direction = "Decrease"
-        type      = "ChangeCount"
-        value     = 1
-        cooldown  = "PT1M"
-      }
-    }
-  }
-
-  notification {
-    email {
-      send_to_subscription_administrator    = true
-      send_to_subscription_co_administrator = true
-      custom_emails                         = ["rwbarreto@gmail.com"]
-    }
-  }
-}
-
-resource "azurerm_network_security_group" "nsg" {
-  name                = "nsg-iac1"
-  resource_group_name = azurerm_resource_group.rg.name
-  location            = azurerm_resource_group.rg.location
-
-  security_rule {
-    name                       = "SSH"
-    priority                   = 101
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "*"
-    source_port_range          = "*"
-    source_address_prefix      = "*"
-    destination_port_range     = "22"
-    destination_address_prefix = "*"
-  }
-
-  tags = {
-    "environment" = "DEV"
-  }
-}
-
-resource "azurerm_public_ip" "pip_mysql" {
-  name                    = "pip-iac1-mysql"
-  allocation_method       = "Dynamic"
-  idle_timeout_in_minutes = 30
-  resource_group_name     = azurerm_resource_group.rg.name
-  location                = azurerm_resource_group.rg.location
-
-  tags = {
-    environment = "DEV"
-  }
-}
-
-resource "azurerm_network_interface" "nic_mysql" {
-  name                = "nic-iac1-mysql"
-  resource_group_name = azurerm_resource_group.rg.name
-  location            = azurerm_resource_group.rg.location
-
-  ip_configuration {
-    name                          = "internal"
-    private_ip_address_allocation = "Static"
-    private_ip_address            = cidrhost("10.0.2.4/24", 4)
-    subnet_id                     = azurerm_subnet.snet.id
-    public_ip_address_id          = azurerm_public_ip.pip_mysql.id
-  }
-}
-
-resource "azurerm_network_interface_security_group_association" "nicsga" {
-  network_interface_id      = azurerm_network_interface.nic_mysql.id
-  network_security_group_id = azurerm_network_security_group.nsg.id
-}
-
-resource "azurerm_linux_virtual_machine" "vm_mysql" {
-  name                  = "vm-mysql-iac1"
-  resource_group_name   = azurerm_resource_group.rg.name
-  location              = azurerm_resource_group.rg.location
-  size                  = "Standard_B2s"
-  admin_username        = "adminuser"
-  network_interface_ids = [azurerm_network_interface.nic_mysql.id]
-
-  admin_ssh_key {
-    username   = "adminuser"
-    public_key = file("~/.ssh/id_rsa.pub")
-  }
-
-  os_disk {
-    caching              = "ReadWrite"
-    storage_account_type = "Standard_LRS"
-  }
-
-  source_image_reference {
-    publisher = "Canonical"
-    offer     = "UbuntuServer"
-    sku       = "18.04-LTS"
-    version   = "latest"
-  }
-}
-
-data "azurerm_public_ip" "pip" {
-  name                = azurerm_public_ip.pip.name
-  resource_group_name = azurerm_resource_group.rg.name
-  depends_on          = [azurerm_virtual_machine_scale_set.vmss]
-}
-
-output "public_ip_address" {
-  value = data.azurerm_public_ip.pip.ip_address
-}
-
-data "azurerm_public_ip" "pip_mysql" {
-  name                = azurerm_public_ip.pip_mysql.name
-  resource_group_name = azurerm_resource_group.rg.name
-  depends_on          = [azurerm_linux_virtual_machine.vm_mysql]
-}
-
-output "public_ip_address_mysql" {
-  value = data.azurerm_public_ip.pip_mysql.ip_address
-}
-
-resource "null_resource" "mysql_install" {
-  provisioner "remote-exec" {
-    inline = [
-      "sudo apt-get update",
-      "sudo apt-get --yes --force-yes install docker.io",
-      "sudo docker run -p 3306:3306 --name wordpress-mysql --restart always -e MYSQL_ROOT_PASSWORD=jhjggykjhd85d83h -e MYSQL_DATABASE=wordpress -e MYSQL_USER=usr-wordpress -e MYSQL_PASSWORD=jhjggykjhd85d83h -d mysql:5.7",
-    ]
-
-    connection {
-      host        = data.azurerm_public_ip.pip_mysql.ip_address
-      user        = "adminuser"
-      type        = "ssh"
-      private_key = file("~/.ssh/id_rsa.insecure")
-      timeout     = "1m"
-      agent       = false
     }
   }
 }
