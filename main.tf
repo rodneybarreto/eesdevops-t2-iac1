@@ -64,7 +64,7 @@ resource "azurerm_lb_probe" "lbp" {
   name                = "lbp-iac1"
   port                = 80
   protocol            = "Http"
-  request_path        = "/wpadmin/images/wordpress-logo.svg"
+  request_path        = "/wordpressuser/images/wordpress-logo.svg"
   loadbalancer_id     = azurerm_lb.lb.id
   resource_group_name = azurerm_resource_group.rg.name
 }
@@ -117,7 +117,7 @@ resource "azurerm_virtual_machine_scale_set" "vmss" {
 
   os_profile {
     computer_name_prefix = "wpvm"
-    admin_username       = "wpadmin"
+    admin_username       = "wordpressuser"
     custom_data          = file("web.conf")
   }
 
@@ -125,7 +125,7 @@ resource "azurerm_virtual_machine_scale_set" "vmss" {
     disable_password_authentication = true
 
     ssh_keys {
-      path     = "/home/wpadmin/.ssh/authorizad_keys"
+      path     = "/home/wordpressuser/.ssh/authorizad_keys"
       key_data = file("~/.ssh/id_rsa.pub")
     }
   }
